@@ -3,8 +3,8 @@ package main
 import (
 	"os"
 
-	"web-content-downloader/lib"
-	"web-content-downloader/logger"
+	"web-content-downloader/internal/service"
+	"web-content-downloader/pkg/logger"
 
 	"github.com/urfave/cli/v2"
 )
@@ -42,8 +42,8 @@ func main() {
 // RunPipeline - Function that will run the server
 func RunPipeline(c *cli.Context) error {
 	csvPath := c.String("PATH")
-	pipelineStruct := lib.NewPipelineStruct(csvPath)
+	pipelineStruct := service.NewPipelineStruct()
 
-	pipelineStruct.TriggerPipeline()
+	pipelineStruct.TriggerPipeline(csvPath)
 	return nil
 }
