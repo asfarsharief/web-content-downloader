@@ -1,25 +1,31 @@
 package service
 
 import (
+	"bufio"
 	"encoding/csv"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 	"web-content-downloader/pkg/constants"
 	"web-content-downloader/pkg/logger"
 )
 
 type PipelineStruct struct {
-	filePath     string
-	fileReader   io.Reader
-	sem          chan struct{}
-	urlChannel   chan UrlData
-	dataChannel  chan UrlData
-	errorChannel chan UrlData
-	waitGroup    *sync.WaitGroup
-	errorList    [][]string
+	filePath      string
+	fileReader    io.Reader
+	sem           chan struct{}
+	urlChannel    chan UrlData
+	dataChannel   chan UrlData
+	errorChannel  chan UrlData
+	matrixChannel chan time.Duration
+	waitGroup     *sync.WaitGroup
+	errorList     []UrlData
+	processed     int
+	total         int
 }
 
 type UrlData struct {
@@ -38,11 +44,32 @@ type PipelineInterface interface {
 
 func NewPipelineStruct() PipelineInterface {
 	return &PipelineStruct{
-		sem:          make(chan struct{}, constants.MaxWorkers),
-		urlChannel:   make(chan UrlData),
-		dataChannel:  make(chan UrlData),
-		errorChannel: make(chan UrlData),
-		waitGroup:    &sync.WaitGroup{},
+		sem:           make(chan struct{}, constants.MaxWorkers),
+		urlChannel:    make(chan UrlData),
+		dataChannel:   make(chan UrlData),
+		errorChannel:  make(chan UrlData),
+		matrixChannel: make(chan time.Duration),
+		waitGroup:     &sync.WaitGroup{},
+	}
+}
+
+var activeCount int32 = 1
+
+func (ps *PipelineStruct) progressBar() {
+	defer ps.waitGroup.Done()
+	ps.waitGroup.Add(1)
+	for {
+		time.Sleep(500 * time.Millisecond)
+		percent := (atomic.LoadInt32(&activeCount) * 100) / int32(ps.total)
+		bar := ""
+		for i := 0; i < int(percent)/2; i++ {
+			bar += "█"
+		}
+		fmt.Printf("\rProgress: [%-50s] %d%%", bar, percent)
+		if atomic.LoadInt32(&activeCount) == int32(ps.total) {
+			fmt.Println("\nDownload complete!")
+			return
+		}
 	}
 }
 
@@ -55,8 +82,16 @@ func (ps *PipelineStruct) TriggerPipeline(filePath string) {
 		return
 	}
 	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	lines := 0
+	for scanner.Scan() {
+		lines++
+	}
+
+	ps.total = lines
+	file.Seek(0, 0)
 	ps.fileReader = file
-	fmt.Println("wg start")
 	ps.waitGroup.Add(1)
 
 	// Start pipeline
@@ -64,36 +99,28 @@ func (ps *PipelineStruct) TriggerPipeline(filePath string) {
 	go ps.ProcessUrls()
 	go ps.PersistContent()
 	go ps.HandleErrors()
+	go ps.progressBar()
+
+	var total time.Duration
+	count := 0
+	for t := range ps.matrixChannel {
+		total += t
+		count++
+	}
 
 	// Wait for all goroutines to finish
-	fmt.Println("waiting wg")
 	ps.waitGroup.Wait()
 
-	fmt.Println("here?")
 	// Close channels after everything has finished
-	// close(ps.urlChannel)
 	close(ps.dataChannel)
 	close(ps.errorChannel)
 
+	logger.Infof("Total Urls Processed: %v || Total Success: %v || Total Failed: %v", ps.processed, count, len(ps.errorList))
+	logger.Infof("Total time taken: %v || Average Download Time: %v\n", total, total/time.Duration(count))
 	if len(ps.errorList) > 0 {
-		csvFile, err := os.Create("./store/failedUrls.csv")
-		if err != nil {
-			fmt.Println("Error creating file:", err)
-			return
-		}
-		defer csvFile.Close()
-
-		writer := csv.NewWriter(csvFile)
-		writer.Write([]string{"Index", "Url", "Error"})
-		fmt.Println("Writing error")
-		// Write data to CSV file
-		for _, row := range ps.errorList {
-			fmt.Println(row)
-			err := writer.Write(row)
-			if err != nil {
-				fmt.Println("Error writing record to file:", err)
-				return
-			}
+		logger.Info("List of failed Urls with Index and error:")
+		for _, err := range ps.errorList {
+			fmt.Printf("%d: %v || error: %s \n", err.index, err.url, err.err)
 		}
 	}
 }
@@ -101,22 +128,20 @@ func (ps *PipelineStruct) TriggerPipeline(filePath string) {
 func (ps *PipelineStruct) ReadAndProcessUrlsFromCsv() {
 	defer func() {
 		close(ps.urlChannel)
-		fmt.Println("wg start")
 		ps.waitGroup.Done()
 	}()
-	// Create a new CSV reader
+	logger.Info("Reading file...")
 	reader := csv.NewReader(ps.fileReader)
 	isFirst := true
 	// Read CSV row by row
-	index := 1
 	for {
-		fmt.Println("reading: ", index)
 		record, err := reader.Read()
 		if err == io.EOF {
 			break // End of file
 		}
 		if err != nil {
 			// Handle other read errors
+			atomic.AddInt32(&activeCount, 1)
 			logger.Error("Error reading CSV:", err)
 			continue
 		}
@@ -125,67 +150,68 @@ func (ps *PipelineStruct) ReadAndProcessUrlsFromCsv() {
 			continue
 		}
 		// Reserve a slot for concurrent processing
+		ps.processed++
 		ps.sem <- struct{}{}
-		fmt.Println(fmt.Println("wg ", index))
 		ps.waitGroup.Add(1)
-		fmt.Println("pushing: ", index)
 		ps.urlChannel <- UrlData{
-			index: index,
+			index: ps.processed,
 			url:   record[0],
 		} // Send the URL to the channel for processing
-		index++
 	}
 }
 
 func (ps *PipelineStruct) ProcessUrls() {
 	// Read from URL channel
+	processUrlWg := sync.WaitGroup{}
 	for data := range ps.urlChannel {
-		fmt.Println("Processing URL:", data.index, data.url)
+		processUrlWg.Add(1)
+		go func(data UrlData, processUrlWg *sync.WaitGroup) {
+			defer processUrlWg.Done()
+			start := time.Now()
+			resp, err := http.Get(data.url)
+			if err != nil {
+				// logger.Error("Error making GET request:", err)
+				data.err = err
+				ps.errorChannel <- data
+				<-ps.sem
+				ps.waitGroup.Done()
+				atomic.AddInt32(&activeCount, 1)
+				return
+			}
+			defer resp.Body.Close() // Ensure that the response body is closed after use
 
-		resp, err := http.Get(data.url)
-		if err != nil {
-			logger.Error("Error making GET request:", err)
-			data.err = err
-			ps.errorChannel <- data
-			<-ps.sem
-			fmt.Println("wg ", data.index)
-			ps.waitGroup.Done()
-			continue
-		}
-		defer resp.Body.Close() // Ensure that the response body is closed after use
-
-		// Read the response body
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			logger.Error("Error reading response body:", err)
-			data.err = err
-			ps.errorChannel <- data
-			<-ps.sem
-			fmt.Println("wg ", data.index)
-			ps.waitGroup.Done()
-			continue
-		}
-
-		// Send data to the data channel
-		data.data = string(body)
-		ps.dataChannel <- data
-		<-ps.sem // Release the semaphore slot after processing
+			// Read the response body
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				data.err = err
+				ps.errorChannel <- data
+				<-ps.sem
+				ps.waitGroup.Done()
+				atomic.AddInt32(&activeCount, 1)
+				return
+			}
+			// Send data to the data channel
+			ps.matrixChannel <- time.Since(start)
+			data.data = string(body)
+			ps.dataChannel <- data
+			<-ps.sem // Release the semaphore slot after processing
+		}(data, &processUrlWg)
 	}
-	fmt.Println("Existing from processUrls...")
+	processUrlWg.Wait()
+	close(ps.matrixChannel)
 }
 
 func (ps *PipelineStruct) PersistContent() {
 	// Persist content (process data channel)
 	for data := range ps.dataChannel {
-		fmt.Println("Persisting:", data.index, data.url)
 		// uniqueKey := uuid.New()
 		file, err := os.Create(fmt.Sprintf("./store/%v.txt", data.index))
 		if err != nil {
-			fmt.Println("Error creating file:", err)
+			// logger.Error("Error creating file:", err)
 			data.err = err
 			ps.errorChannel <- data
-			fmt.Println("wg ", data.index)
 			ps.waitGroup.Done()
+			atomic.AddInt32(&activeCount, 1)
 			continue
 		}
 		defer file.Close() // Make sure to close the file when we're done
@@ -193,22 +219,20 @@ func (ps *PipelineStruct) PersistContent() {
 		// Write the data to the file
 		_, err = file.WriteString(data.data)
 		if err != nil {
-			fmt.Println("Error writing to file:", err)
+			// logger.Error("Error writing to file:", err)
 			data.err = err
 			ps.errorChannel <- data
-			fmt.Println("wg ", data.index)
 			ps.waitGroup.Done()
+			atomic.AddInt32(&activeCount, 1)
 			continue
 		}
-		fmt.Println("wg ", data.index)
 		ps.waitGroup.Done()
+		atomic.AddInt32(&activeCount, 1)
 	}
-	fmt.Println("Existing PersistContent...")
 }
 
 func (ps *PipelineStruct) HandleErrors() {
 	for errData := range ps.errorChannel {
-		fmt.Println("Error encountered: ", errData.index)
-		ps.errorList = append(ps.errorList, []string{string(errData.index), errData.url, errData.err.Error()})
+		ps.errorList = append(ps.errorList, errData)
 	}
 }
