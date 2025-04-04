@@ -28,6 +28,11 @@ func main() {
 					Usage:    "Full path of csv file",
 					Required: true,
 				},
+				&cli.StringFlag{
+					Name:    "Output",
+					Aliases: []string{"o", "OUTPUT"},
+					Usage:   "Give output folder name",
+				},
 			},
 		},
 	}
@@ -42,7 +47,8 @@ func main() {
 // RunPipeline - Function that will run the server
 func RunPipeline(c *cli.Context) error {
 	csvPath := c.String("PATH")
-	pipelineStruct := service.NewPipelineStruct()
+	output := c.String("OUTPUT")
+	pipelineStruct := service.NewPipelineStruct(output)
 
 	pipelineStruct.TriggerPipeline(csvPath)
 	return nil

@@ -12,9 +12,12 @@ import (
 	"time"
 	"web-content-downloader/pkg/constants"
 	"web-content-downloader/pkg/logger"
+
+	"github.com/google/uuid"
 )
 
 type PipelineStruct struct {
+	outputName    string
 	filePath      string
 	fileReader    io.Reader
 	sem           chan struct{}
@@ -42,7 +45,7 @@ type PipelineInterface interface {
 	PersistContent()
 }
 
-func NewPipelineStruct() PipelineInterface {
+func NewPipelineStruct(outputName string) PipelineInterface {
 	return &PipelineStruct{
 		sem:           make(chan struct{}, constants.MaxWorkers),
 		urlChannel:    make(chan UrlData),
@@ -50,6 +53,7 @@ func NewPipelineStruct() PipelineInterface {
 		errorChannel:  make(chan UrlData),
 		matrixChannel: make(chan time.Duration),
 		waitGroup:     &sync.WaitGroup{},
+		outputName:    outputName,
 	}
 }
 
@@ -67,7 +71,7 @@ func (ps *PipelineStruct) progressBar() {
 		}
 		fmt.Printf("\rProgress: [%-50s] %d%%", bar, percent)
 		if atomic.LoadInt32(&activeCount) == int32(ps.total) {
-			fmt.Println("\nDownload complete!")
+			logger.Info("Download complete!")
 			return
 		}
 	}
@@ -78,7 +82,7 @@ func (ps *PipelineStruct) TriggerPipeline(filePath string) {
 
 	file, err := os.Open(filePath)
 	if err != nil {
-		fmt.Println("Error opening file:", err)
+		logger.Error("Error opening file:", err)
 		return
 	}
 	defer file.Close()
@@ -89,6 +93,7 @@ func (ps *PipelineStruct) TriggerPipeline(filePath string) {
 		lines++
 	}
 
+	logger.Info("Total number of entries: ", lines)
 	ps.total = lines
 	file.Seek(0, 0)
 	ps.fileReader = file
@@ -156,12 +161,11 @@ func (ps *PipelineStruct) ReadAndProcessUrlsFromCsv() {
 		ps.urlChannel <- UrlData{
 			index: ps.processed,
 			url:   record[0],
-		} // Send the URL to the channel for processing
+		}
 	}
 }
 
 func (ps *PipelineStruct) ProcessUrls() {
-	// Read from URL channel
 	processUrlWg := sync.WaitGroup{}
 	for data := range ps.urlChannel {
 		processUrlWg.Add(1)
@@ -170,7 +174,6 @@ func (ps *PipelineStruct) ProcessUrls() {
 			start := time.Now()
 			resp, err := http.Get(data.url)
 			if err != nil {
-				// logger.Error("Error making GET request:", err)
 				data.err = err
 				ps.errorChannel <- data
 				<-ps.sem
@@ -178,9 +181,8 @@ func (ps *PipelineStruct) ProcessUrls() {
 				atomic.AddInt32(&activeCount, 1)
 				return
 			}
-			defer resp.Body.Close() // Ensure that the response body is closed after use
+			defer resp.Body.Close()
 
-			// Read the response body
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				data.err = err
@@ -190,11 +192,10 @@ func (ps *PipelineStruct) ProcessUrls() {
 				atomic.AddInt32(&activeCount, 1)
 				return
 			}
-			// Send data to the data channel
 			ps.matrixChannel <- time.Since(start)
 			data.data = string(body)
 			ps.dataChannel <- data
-			<-ps.sem // Release the semaphore slot after processing
+			<-ps.sem
 		}(data, &processUrlWg)
 	}
 	processUrlWg.Wait()
@@ -202,10 +203,20 @@ func (ps *PipelineStruct) ProcessUrls() {
 }
 
 func (ps *PipelineStruct) PersistContent() {
-	// Persist content (process data channel)
+	uniqueKey := uuid.New()
+	folderName := fmt.Sprintf("./store/%s-%s", ps.outputName, uniqueKey.String())
+	if ps.outputName == "" {
+		folderName = fmt.Sprintf("./store/%s", uniqueKey.String())
+		ps.outputName = uniqueKey.String()
+	}
+	err := os.Mkdir(folderName, 0755) // 0755 gives read/write/execute permissions
+	if err != nil {
+		logger.Error("Error creating folder:", err)
+		return
+	}
+	defer logger.Info("Downloaded files can be found in: ", folderName)
 	for data := range ps.dataChannel {
-		// uniqueKey := uuid.New()
-		file, err := os.Create(fmt.Sprintf("./store/%v.txt", data.index))
+		file, err := os.Create(fmt.Sprintf("%s/%s-%d.txt", folderName, ps.outputName, data.index))
 		if err != nil {
 			// logger.Error("Error creating file:", err)
 			data.err = err
