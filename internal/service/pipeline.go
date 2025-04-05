@@ -5,12 +5,13 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 	"web-content-downloader/pkg/constants"
+	"web-content-downloader/pkg/httpservice"
 	"web-content-downloader/pkg/logger"
 
 	"github.com/google/uuid"
@@ -32,10 +33,11 @@ type PipelineStruct struct {
 }
 
 type UrlData struct {
-	index int
-	url   string
-	data  string
-	err   error
+	index     int
+	url       string
+	data      string
+	err       error
+	timeTaken time.Duration
 }
 
 type PipelineInterface interface {
@@ -58,6 +60,9 @@ func NewPipelineStruct(outputName string) PipelineInterface {
 }
 
 var activeCount int32 = 1
+var OpenFile = os.Open
+var BasePath = "./store"
+var Get = httpservice.Get
 
 func (ps *PipelineStruct) progressBar() {
 	defer ps.waitGroup.Done()
@@ -71,6 +76,7 @@ func (ps *PipelineStruct) progressBar() {
 		}
 		fmt.Printf("\rProgress: [%-50s] %d%%", bar, percent)
 		if atomic.LoadInt32(&activeCount) == int32(ps.total) {
+			fmt.Println("")
 			logger.Info("Download complete!")
 			return
 		}
@@ -80,7 +86,7 @@ func (ps *PipelineStruct) progressBar() {
 func (ps *PipelineStruct) TriggerPipeline(filePath string) {
 	logger.Infof("Pipeline triggered: File: %s", filePath)
 
-	file, err := os.Open(filePath)
+	file, err := OpenFile(filePath)
 	if err != nil {
 		logger.Error("Error opening file:", err)
 		return
@@ -97,6 +103,12 @@ func (ps *PipelineStruct) TriggerPipeline(filePath string) {
 	ps.total = lines
 	file.Seek(0, 0)
 	ps.fileReader = file
+	uniqueKey := uuid.New()
+	outputName := uniqueKey.String()
+	if ps.outputName != "" {
+		outputName = fmt.Sprintf("%s-%s", ps.outputName, uniqueKey.String())
+	}
+	ps.outputName = outputName
 	ps.waitGroup.Add(1)
 
 	// Start pipeline
@@ -120,12 +132,17 @@ func (ps *PipelineStruct) TriggerPipeline(filePath string) {
 	close(ps.dataChannel)
 	close(ps.errorChannel)
 
+	logger.Info("Output files present in: ", filepath.Join(BasePath, outputName))
 	logger.Infof("Total Urls Processed: %v || Total Success: %v || Total Failed: %v", ps.processed, count, len(ps.errorList))
 	logger.Infof("Total time taken: %v || Average Download Time: %v\n", total, total/time.Duration(count))
 	if len(ps.errorList) > 0 {
 		logger.Info("List of failed Urls with Index and error:")
 		for _, err := range ps.errorList {
-			fmt.Printf("%d: %v || error: %s \n", err.index, err.url, err.err)
+			fmt.Println("Index: ", err.index)
+			fmt.Println("Url: ", err.url)
+			fmt.Println("Error: ", err.err)
+			fmt.Println("Time Taken: ", err.timeTaken)
+			fmt.Println("###############################################")
 		}
 	}
 }
@@ -172,9 +189,10 @@ func (ps *PipelineStruct) ProcessUrls() {
 		go func(data UrlData, processUrlWg *sync.WaitGroup) {
 			defer processUrlWg.Done()
 			start := time.Now()
-			resp, err := http.Get(data.url)
+			resp, err := Get(data.url)
 			if err != nil {
 				data.err = err
+				data.timeTaken = time.Since(start)
 				ps.errorChannel <- data
 				<-ps.sem
 				ps.waitGroup.Done()
@@ -182,10 +200,10 @@ func (ps *PipelineStruct) ProcessUrls() {
 				return
 			}
 			defer resp.Body.Close()
-
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				data.err = err
+				data.timeTaken = time.Since(start)
 				ps.errorChannel <- data
 				<-ps.sem
 				ps.waitGroup.Done()
@@ -203,20 +221,14 @@ func (ps *PipelineStruct) ProcessUrls() {
 }
 
 func (ps *PipelineStruct) PersistContent() {
-	uniqueKey := uuid.New()
-	folderName := fmt.Sprintf("./store/%s-%s", ps.outputName, uniqueKey.String())
-	if ps.outputName == "" {
-		folderName = fmt.Sprintf("./store/%s", uniqueKey.String())
-		ps.outputName = uniqueKey.String()
-	}
+	folderName := filepath.Join(BasePath, ps.outputName)
 	err := os.Mkdir(folderName, 0755) // 0755 gives read/write/execute permissions
 	if err != nil {
 		logger.Error("Error creating folder:", err)
 		return
 	}
-	defer logger.Info("Downloaded files can be found in: ", folderName)
 	for data := range ps.dataChannel {
-		file, err := os.Create(fmt.Sprintf("%s/%s-%d.txt", folderName, ps.outputName, data.index))
+		file, err := os.Create(filepath.Join(folderName, fmt.Sprintf("%s-%d", ps.outputName, data.index)))
 		if err != nil {
 			// logger.Error("Error creating file:", err)
 			data.err = err

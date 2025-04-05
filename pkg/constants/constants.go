@@ -1,5 +1,5 @@
 package constants
 
-const (
+var (
 	MaxWorkers = 10
 )

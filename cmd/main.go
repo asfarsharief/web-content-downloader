@@ -49,7 +49,6 @@ func RunPipeline(c *cli.Context) error {
 	csvPath := c.String("PATH")
 	output := c.String("OUTPUT")
 	pipelineStruct := service.NewPipelineStruct(output)
-
 	pipelineStruct.TriggerPipeline(csvPath)
 	return nil
 }
